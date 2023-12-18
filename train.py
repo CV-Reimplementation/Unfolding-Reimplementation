@@ -1,62 +1,129 @@
-import os,cv2
-import torch,math,random
-import numpy as np
-from torch.utils.data import Dataset,DataLoader
-from torch.autograd import Variable
-import matplotlib.image as img
-from dataset import my_dataset_threeIn
-import torchvision.transforms as transforms
-from IterModel3 import Deshadow_netS4
-from UTILS import seed_everything
-from tqdm import tqdm
+import warnings
+
+import torch.optim as optim
 from accelerate import Accelerator
+from pytorch_msssim import SSIM
+from torch.utils.data import DataLoader
+from torchmetrics.functional import peak_signal_noise_ratio, structural_similarity_index_measure
+from tqdm import tqdm
+
+from config import Config
+from data import get_training_data, get_validation_data
+from models import *
+from utils import *
+
+warnings.filterwarnings('ignore')
+
+opt = Config('config.yml')
+
+seed_everything(opt.OPTIM.SEED)
+
+def train():
+    # Accelerate
+    accelerator = Accelerator(log_with='wandb') if opt.OPTIM.WANDB else Accelerator()
+    device = accelerator.device
+    config = {
+        "dataset": opt.TRAINING.TRAIN_DIR
+    }
+    accelerator.init_trackers("shadow", config=config)
+
+    if accelerator.is_local_main_process:
+        os.makedirs(opt.TRAINING.SAVE_DIR, exist_ok=True)
+
+    # Data Loader
+    train_dir = opt.TRAINING.TRAIN_DIR
+    val_dir = opt.TRAINING.VAL_DIR
+
+    train_dataset = get_training_data(train_dir, opt.MODEL.INPUT, opt.MODEL.TARGET, {'w': opt.TRAINING.PS_W, 'h': opt.TRAINING.PS_H})
+    trainloader = DataLoader(dataset=train_dataset, batch_size=opt.OPTIM.BATCH_SIZE, shuffle=True, num_workers=16,
+                             drop_last=False, pin_memory=True)
+    val_dataset = get_validation_data(val_dir, opt.MODEL.INPUT, opt.MODEL.TARGET, {'w': opt.TRAINING.PS_W, 'h': opt.TRAINING.PS_H, 'ori': opt.TRAINING.ORI})
+    testloader = DataLoader(dataset=val_dataset, batch_size=1, shuffle=False, num_workers=8, drop_last=False,
+                            pin_memory=True)
+
+    # Model & Loss
+    model = Model()
+    criterion_psnr = torch.nn.MSELoss()
+
+    # Optimizer & Scheduler
+    optimizer_b = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=opt.OPTIM.LR_INITIAL, betas=(0.9, 0.999), eps=1e-8)
+    scheduler_b = optim.lr_scheduler.CosineAnnealingLR(optimizer_b, opt.OPTIM.NUM_EPOCHS, eta_min=opt.OPTIM.LR_MIN)
+
+    trainloader, testloader = accelerator.prepare(trainloader, testloader)
+    model = accelerator.prepare(model)
+    optimizer_b, scheduler_b = accelerator.prepare(optimizer_b, scheduler_b)
+
+    start_epoch = 1
+    best_epoch = 1
+    best_psnr = 0
+    size = len(testloader)
+    # training
+    for epoch in range(start_epoch, opt.OPTIM.NUM_EPOCHS + 1):
+        model.train()
+
+        for i, data in enumerate(tqdm(trainloader, disable=not accelerator.is_local_main_process)):
+            # get the inputs; data is a list of [target, input, filename]
+            inp = data[0]
+            mas = data[1]
+            tar = data[2]
+
+            # forward
+            optimizer_b.zero_grad()
+            listA, listJ = model(inp, mas)
+
+            loss_psnr = sum([criterion_psnr(listJ[j], tar) for j in range(len(listJ))]) + 1e-6 * sum([criterion_psnr(listA[j], mas * listA[j]) for j in range(len(listA))])
+
+            train_loss = loss_psnr
+
+            # backward
+            accelerator.backward(train_loss)
+            optimizer_b.step()
+
+        scheduler_b.step()
+
+        # testing
+        if epoch % opt.TRAINING.VAL_AFTER_EVERY == 0:
+            model.eval()
+            psnr = 0
+            ssim = 0
+            for idx, data in enumerate(tqdm(testloader, disable=not accelerator.is_local_main_process)):
+                # get the inputs; data is a list of [targets, inputs, filename]
+                inp = data[0]
+                mas = data[1]
+                tar = data[2]
+
+                with torch.no_grad():
+                    _, listJ = model(inp, mas)
+                    res = listJ[-1]
+
+                res, tar = accelerator.gather((res, tar))
+
+                psnr += peak_signal_noise_ratio(res, tar, data_range=1)
+                ssim += structural_similarity_index_measure(res, tar, data_range=1)
+
+            psnr /= size
+            ssim /= size
+
+            if psnr > best_psnr:
+                # save model
+                best_epoch = epoch
+                best_psnr = psnr
+                save_checkpoint({
+                    'state_dict': model.state_dict(),
+                }, epoch, opt.MODEL.SESSION, opt.TRAINING.SAVE_DIR)
+
+            if accelerator.is_local_main_process:
+                accelerator.log({
+                    "PSNR": psnr,
+                    "SSIM": ssim,
+                }, step=epoch)
+
+                print(
+                    "epoch: {}, PSNR: {}, SSIM: {}, best PSNR: {}, best epoch: {}"
+                    .format(epoch, psnr, ssim, best_psnr, best_epoch))
+
+    accelerator.end_training()
+
 
 if __name__ == '__main__':
-    seed_everything()
-
-    accelerator = Accelerator()
-
-    SAVE_PATH = './checkpoint.pth'
-
-    trans_train = transforms.Compose(
-        [
-            transforms.Resize([256,256]),
-            transforms.ToTensor()
-        ])
-    train_in_path = "/gdata1/zhuyr/Derain_torch/shadow_SRD_test/shadow_re/"
-    train_gt_path = "/gdata1/zhuyr/Derain_torch/shadow_SRD_test/shadow_free_re/"
-    train_mask_path = "/gdata1/zhuyr/Derain_torch/shadow_SRD_test/shadow_mask_re/"
-    filenames_train_in = sorted(os.listdir(train_in_path))
-    filenames_train_gt = sorted(os.listdir(train_gt_path))
-    filenames_train_mask = sorted((os.listdir(train_mask_path)))
-    assert(filenames_train_mask==filenames_train_in)
-    assert(filenames_train_in==filenames_train_gt)
-    
-    net = Deshadow_netS4(ex1=6,ex2=4)
-    optimizer = torch.optim.Adam(net.parameters(), lr=5e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=150)
-    criterion = torch.nn.MSELoss()
-    print('#generator parameters:',sum(param.numel() for param in net.parameters()))
-
-    train_data = my_dataset_threeIn(
-        root_in=train_in_path,root_label =train_gt_path
-       ,root_mask=train_mask_path,transform=trans_train)
-    train_loader = DataLoader(dataset=train_data, batch_size=2,num_workers=4,shuffle=True)
-
-    net, optimizer, scheduler, train_loader = accelerator.prepare(net, optimizer, scheduler, train_loader)
-
-    epoch = 150
-
-    net.train()
-    for curr in range(epoch):
-        for i, (data_in, label, mask) in enumerate(tqdm(train_loader)):
-            _, _, _, res = net(data_in, mask)
-            res = torch.clamp(res, 0., 1.)
-
-            loss = criterion(res, label)
-            loss.backward()
-
-            optimizer.step()
-            scheduler.step()
-        torch.save(net.state_dict(), SAVE_PATH)
-        print("Epoch: ", curr)
+    train()
